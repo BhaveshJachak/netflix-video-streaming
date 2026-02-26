@@ -521,90 +521,39 @@ ratelimit:{endpoint}:{id}        → COUNT                               TTL var
 
 ```mermaid
 flowchart TD
-    subgraph Clients
-        C["Client<br/>Mobile · Web · Smart TV"]
-    end
-
-    subgraph Edge
-        DNS["GeoDNS"]
-        WAF["WAF + DDoS"]
-        CDN["Open Connect CDN<br/>(ISP Appliances)"]
-    end
-
-    subgraph Gateway
-        RL["Rate Limiter"]
-        GW["API Gateway"]
-        LB["Load Balancer"]
-    end
-
-    subgraph Services
-        AUTH["Auth"]
-        USER["User"]
-        CATALOG["Catalog"]
-        SEARCH["Search"]
-        STREAM["Streaming"]
-        HISTORY["Watch History"]
-        REC["Recommendation"]
-    end
-
-    subgraph Cache["Redis Cluster"]
-        R_SESSION["Sessions"]
-        R_CATALOG["Catalog Cache<br/>(Sorted Sets)"]
-        R_TRENDING["Trending"]
-        R_RESUME["Resume Progress"]
-    end
-
-    subgraph DB["Databases"]
-        PG_USER["PostgreSQL<br/>(Users)"]
-        PG_CATALOG["PostgreSQL<br/>(Catalog)"]
-        CASS["Cassandra<br/>(Watch History)"]
-        ES["Elasticsearch"]
-        S3["S3 (Videos)"]
-    end
-
-    subgraph Async
-        KAFKA["Kafka"]
-        WORKERS["Workers<br/>(Trending · Cache · ML)"]
-    end
-
-    subgraph ML["ML Platform"]
-        FEATURE["Feature Store"]
-        MODEL["Model Serving"]
-    end
-
-    subgraph DRM
-        LICENSE["License Server<br/>(Widevine · FairPlay)"]
-    end
-
-    C --> DNS
-    C -->|"Video Chunks"| CDN
-    C --> WAF --> RL --> GW --> LB
-
-    LB --> AUTH & USER & CATALOG & SEARCH & STREAM & HISTORY
-
-    AUTH --> R_SESSION
-    AUTH --> PG_USER
-    USER --> PG_USER
-
-    CATALOG -->|"READ"| R_CATALOG
-    CATALOG -->|"WRITE"| PG_CATALOG
-    CATALOG --> REC
-
-    SEARCH --> ES
-
-    STREAM --> LICENSE
+    C[Client] -->|API| GW[API Gateway]
+    C -->|Video| CDN[Open Connect CDN]
+    
+    GW --> AUTH[Auth Service]
+    GW --> CATALOG[Catalog Service]
+    GW --> SEARCH[Search Service]
+    GW --> STREAM[Streaming Service]
+    GW --> HISTORY[Watch History Service]
+    
+    AUTH --> REDIS[(Redis)]
+    AUTH --> PG_USER[(PostgreSQL Users)]
+    
+    CATALOG -->|READ| REDIS
+    CATALOG -->|WRITE| PG_CATALOG[(PostgreSQL Catalog)]
+    CATALOG --> REC[Recommendation Service]
+    
+    SEARCH --> ES[(Elasticsearch)]
+    
+    STREAM --> DRM[License Server]
     STREAM --> CDN
-    CDN --> S3
-
-    HISTORY -->|"1. Write First"| CASS
-    HISTORY -->|"2. Update Cache"| R_RESUME
-    HISTORY -->|"3. Publish"| KAFKA
-
-    KAFKA --> WORKERS
-    WORKERS --> R_CATALOG & R_TRENDING & ES
-
-    WORKERS --> FEATURE
-    REC --> FEATURE & MODEL
+    CDN --> S3[(S3 Videos)]
+    
+    HISTORY --> CASS[(Cassandra)]
+    HISTORY --> REDIS
+    HISTORY --> KAFKA[Kafka]
+    
+    KAFKA --> SPARK[Spark MapReduce]
+    SPARK --> REDIS
+    SPARK --> ES
+    SPARK --> LAKE[(Data Lake)]
+    
+    LAKE --> ML[ML Training]
+    ML --> REC
 ```
 
 ---
@@ -1063,6 +1012,274 @@ Kafka → Trending Workers → Redis Sorted Sets
 5. **Movement Calculation (Optional):**
    - Compare current rank with rank 1 hour ago
    - Add "↑5" or "↓3" movement indicators
+
+---
+
+### Step 6.1 — MapReduce & Aggregation (Where It's Used)
+
+MapReduce is used for **batch processing** where real-time Redis counters aren't sufficient.
+
+**Use Cases in Netflix System:**
+
+| Use Case | Why MapReduce? | Real-time Alternative |
+|----------|----------------|----------------------|
+| Daily trending reports | Need exact counts, not approximations | Redis ZINCRBY (approximate) |
+| Genre popularity by region | Complex grouping across dimensions | Too many Redis keys |
+| User cohort analysis | Aggregate millions of users | Not feasible in real-time |
+| ML feature generation | Process 2B events/day | Streaming can't handle |
+| Content performance reports | Historical analysis | Redis TTL expires data |
+| Recommendation training | Full dataset joins | Memory constraints |
+
+---
+
+#### 6.1.1 Trending Aggregation with MapReduce (Spark)
+
+**When:** Daily batch job at 2 AM (complements real-time Redis)
+
+**Input:** Kafka watch-events → S3 Data Lake (Parquet files)
+
+```
+Day's events in S3:
+s3://netflix-events/2026/02/26/watch-events/*.parquet
+```
+
+**MapReduce Job (Spark):**
+
+```python
+# MAP PHASE: Extract (titleId, 1) pairs
+def map_watch_event(event):
+    return (event.titleId, 1)
+
+# REDUCE PHASE: Sum counts per title
+def reduce_counts(a, b):
+    return a + b
+
+# SPARK IMPLEMENTATION
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import count, col, dense_rank
+from pyspark.sql.window import Window
+
+spark = SparkSession.builder.appName("TrendingAggregation").getOrCreate()
+
+# Read day's events
+events = spark.read.parquet("s3://netflix-events/2026/02/26/")
+
+# MAP-REDUCE: Count views per title
+trending = events \
+    .groupBy("titleId", "genreId", "region") \
+    .agg(count("*").alias("viewCount"))
+
+# RANK within each genre
+window = Window.partitionBy("genreId").orderBy(col("viewCount").desc())
+ranked = trending.withColumn("rank", dense_rank().over(window))
+
+# OUTPUT: Top 100 per genre
+top_trending = ranked.filter(col("rank") <= 100)
+
+# Write to S3 for reporting
+top_trending.write.parquet("s3://netflix-analytics/trending/2026-02-26/")
+
+# Also update Redis for serving (more accurate than real-time)
+for row in top_trending.collect():
+    redis.zadd(f"trending:daily:{row.genreId}", {row.titleId: row.viewCount})
+```
+
+**Output:**
+```
++----------+--------+--------+-----------+------+
+| titleId  | genreId| region | viewCount | rank |
++----------+--------+--------+-----------+------+
+| title001 | action | US     | 2,847,293 | 1    |
+| title042 | action | US     | 1,923,847 | 2    |
+| title007 | comedy | US     | 3,102,847 | 1    |
++----------+--------+--------+-----------+------+
+```
+
+---
+
+#### 6.1.2 Regional Content Performance (Complex Aggregation)
+
+**Question:** "What's the completion rate per genre per region per device type?"
+
+**Why MapReduce:** 3-dimensional grouping with 50K titles × 5 regions × 25 genres × 4 devices = millions of combinations
+
+```python
+# Multi-dimensional aggregation
+performance = events \
+    .groupBy("region", "genreId", "deviceType") \
+    .agg(
+        count("*").alias("totalViews"),
+        sum(when(col("completed") == True, 1).otherwise(0)).alias("completions"),
+        avg("progressPercent").alias("avgProgress"),
+        countDistinct("profileId").alias("uniqueViewers")
+    ) \
+    .withColumn("completionRate", col("completions") / col("totalViews"))
+
+# Result: Which genres perform best on which devices in which regions?
+# e.g., "Action movies have 78% completion on TV in US but only 45% on mobile in APAC"
+```
+
+---
+
+#### 6.1.3 User Cohort Analysis (ML Features)
+
+**Question:** "Group users by behavior patterns for recommendation training"
+
+```python
+# Step 1: Aggregate user behavior
+user_features = events \
+    .groupBy("profileId") \
+    .agg(
+        count("*").alias("totalWatches"),
+        countDistinct("titleId").alias("uniqueTitles"),
+        avg("sessionDuration").alias("avgSessionMin"),
+        collect_set("genreId").alias("watchedGenres"),
+        
+        # Genre affinity scores
+        sum(when(col("genreId") == "action", col("watchTime")).otherwise(0)).alias("actionTime"),
+        sum(when(col("genreId") == "comedy", col("watchTime")).otherwise(0)).alias("comedyTime"),
+        sum(when(col("genreId") == "drama", col("watchTime")).otherwise(0)).alias("dramaTime")
+    )
+
+# Step 2: Create user embeddings
+user_embeddings = user_features \
+    .withColumn("genreVector", array(
+        col("actionTime") / col("totalWatchTime"),
+        col("comedyTime") / col("totalWatchTime"),
+        col("dramaTime") / col("totalWatchTime")
+        # ... 25 genres
+    ))
+
+# Step 3: Output to Feature Store for ML
+user_embeddings.write.format("delta").save("s3://feature-store/user-embeddings/")
+```
+
+---
+
+#### 6.1.4 Recommendation Model Training (ALS MapReduce)
+
+**Collaborative Filtering with Alternating Least Squares (ALS):**
+
+```python
+from pyspark.ml.recommendation import ALS
+
+# Create user-item interaction matrix
+interactions = events \
+    .groupBy("profileId", "titleId") \
+    .agg(
+        # Implicit feedback: watch time as rating
+        sum("watchTimeMinutes").alias("rating")
+    )
+
+# MAP-REDUCE inside ALS:
+# - MAP: Distribute user-item pairs across nodes
+# - REDUCE: Compute matrix factorization iteratively
+
+als = ALS(
+    maxIter=10,
+    regParam=0.01,
+    userCol="profileId",
+    itemCol="titleId",
+    ratingCol="rating",
+    implicitPrefs=True,  # Implicit feedback (views, not explicit ratings)
+    coldStartStrategy="drop"
+)
+
+# Train model (internally uses MapReduce)
+model = als.fit(interactions)
+
+# Generate recommendations for all users
+userRecs = model.recommendForAllUsers(50)  # Top 50 per user
+
+# Output: Pre-computed recommendations
+userRecs.write.parquet("s3://recommendations/als/2026-02-26/")
+```
+
+**ALS MapReduce Internals:**
+```
+Iteration 1:
+  MAP:    Distribute users across nodes, fix item factors
+  REDUCE: Update user factors (solve least squares)
+
+Iteration 2:
+  MAP:    Distribute items across nodes, fix user factors  
+  REDUCE: Update item factors (solve least squares)
+
+... repeat for 10 iterations until convergence
+```
+
+---
+
+#### 6.1.5 Real-time vs Batch: When to Use What
+
+| Scenario | Use Real-time (Redis/Kafka) | Use Batch (MapReduce/Spark) |
+|----------|----------------------------|----------------------------|
+| Current trending | ✅ ZINCRBY | ❌ Too slow |
+| Resume position | ✅ Redis HSET | ❌ Overkill |
+| Daily reports | ❌ Data expires | ✅ Historical analysis |
+| ML training | ❌ Memory limits | ✅ Process full dataset |
+| Complex aggregations | ❌ Too many keys | ✅ Multi-dimensional |
+| User embeddings | ❌ Can't compute | ✅ Full behavior history |
+| A/B test analysis | ❌ Approximate | ✅ Statistical rigor |
+
+---
+
+#### 6.1.6 Lambda Architecture (Best of Both)
+
+Netflix uses **Lambda Architecture**: Real-time + Batch layers
+
+```
+                    ┌─────────────────────────────────────┐
+                    │           SERVING LAYER             │
+                    │  (Redis - merged real-time + batch) │
+                    └─────────────────────────────────────┘
+                                    ▲
+                    ┌───────────────┴───────────────┐
+                    │                               │
+        ┌───────────────────┐           ┌───────────────────┐
+        │   SPEED LAYER     │           │   BATCH LAYER     │
+        │   (Real-time)     │           │   (MapReduce)     │
+        │                   │           │                   │
+        │ Kafka → Redis     │           │ S3 → Spark → S3   │
+        │ ZINCRBY counters  │           │ Exact aggregates  │
+        │ ~1 sec latency    │           │ ~1 hour latency   │
+        │ Approximate       │           │ Accurate          │
+        └───────────────────┘           └───────────────────┘
+                    ▲                               ▲
+                    │                               │
+                    └───────────────┬───────────────┘
+                                    │
+                            ┌───────────────┐
+                            │    Kafka      │
+                            │ (Event Stream)│
+                            └───────────────┘
+```
+
+**How it works:**
+1. **Speed Layer:** Kafka → Redis for real-time approximate counts
+2. **Batch Layer:** Kafka → S3 → Spark for daily accurate counts
+3. **Serving Layer:** Merge both — use batch as baseline, speed for recent delta
+
+```python
+# Serving layer merge
+def get_trending(genre, window="24h"):
+    if window == "24h":
+        # Real-time is accurate enough
+        return redis.zrevrange(f"trending:{genre}:24h", 0, 49)
+    elif window == "7d":
+        # Merge batch (accurate) + speed (recent)
+        batch_counts = redis.zrevrange(f"trending:batch:{genre}:7d", 0, 49, withscores=True)
+        speed_counts = redis.zrevrange(f"trending:speed:{genre}:24h", 0, 49, withscores=True)
+        
+        # Merge: batch baseline + recent speed delta
+        merged = {}
+        for title, score in batch_counts:
+            merged[title] = score
+        for title, score in speed_counts:
+            merged[title] = merged.get(title, 0) + score
+        
+        return sorted(merged.items(), key=lambda x: -x[1])[:50]
+```
 
 ---
 
