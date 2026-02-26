@@ -510,6 +510,20 @@ flowchart TD
 - Return HLS `.m3u8` to client
 - Client fetches chunks directly from CDN: `GET /cdn/chunks/{id}/{res}/{chunk}`
 - CDN serves from edge cache → on miss, pulls from S3 origin
+- 1. What is a Manifest?
+- A manifest is a text file that acts as a table of contents for a video. Instead of serving one giant video file, Netflix breaks every video into small chunks (2-10 seconds each) and the manifest tells the player which chunks to fetch, in what order, and at what quality.
+
+    HLS Manifest Example (.m3u8)
+    Code
+    #EXTM3U
+    #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+    https://cdn.netflix.com/title123/360p/master.m3u8
+    #EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=842x480
+    https://cdn.netflix.com/title123/480p/master.m3u8
+    #EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+    https://cdn.netflix.com/title123/720p/master.m3u8
+    #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+    https://cdn.netflix.com/title123/1080p/master.m3u8
 
 ### Step 5 — Progress Tracking (Every 30s)
 
