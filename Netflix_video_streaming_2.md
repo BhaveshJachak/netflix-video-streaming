@@ -609,74 +609,731 @@ flowchart TD
 
 ---
 
-## 8. HLD Walkthrough
+## 8. HLD Walkthrough (Detailed Step-by-Step)
 
-### Step 1 — User Login
+### Step 1 — User Opens App & Logs In
 
-1. Client → GeoDNS → nearest region
-2. `POST /v1/auth/login` → Auth Service
-3. Rate limit check in Redis
-4. Verify credentials in PostgreSQL
-5. Create session in Redis, return JWT
+```
+Client → GeoDNS → WAF → Rate Limiter → API Gateway → Auth Service → Redis/PostgreSQL
+```
 
-### Step 2 — Home Feed (CQRS Read Path)
+**Detailed Flow:**
 
-**Key: Read path NEVER touches PostgreSQL**
+1. **DNS Resolution:** Client app resolves `api.netflix.com` via GeoDNS (Route 53)
+2. **Geographic Routing:** GeoDNS returns IP of nearest regional API endpoint (e.g., US-EAST for US users)
+3. **Security Layer:** Request passes through WAF (Web Application Firewall) for DDoS protection and threat filtering
+4. **Rate Limiting:** Redis checks `INCR ratelimit:login:{email}` — allows max 5 attempts per 15 minutes
+5. **API Gateway:** Kong/Envoy validates request schema, extracts headers, routes to Auth Service
+6. **Auth Service Processing:**
+   - Fetch user by email from PostgreSQL: `SELECT * FROM users WHERE email = ?`
+   - Verify password hash using bcrypt
+   - Generate JWT access token (expires: 1 hour) with claims: `{userId, profileId, roles}`
+   - Generate refresh token (expires: 30 days)
+   - Create session in Redis: `SET session:{sessionId} {userId, deviceId, createdAt} EX 3600`
+7. **Response:** Return `{accessToken, refreshToken, expiresIn, profiles[]}`
 
-1. `GET /v1/catalog/home` → Catalog Service
-2. **L1 Cache:** `GET home_feed:{profileId}` (TTL 5m)
-   - HIT → Return (~1ms)
-   - MISS → Continue
-3. **L2 — Redis Sorted Sets:**
+**Why This Design:**
+- GeoDNS ensures lowest latency by routing to nearest region
+- Rate limiting prevents brute force attacks
+- JWT is stateless — services can validate without calling Auth Service
+- Session in Redis enables forced logout across devices
+
+---
+
+### Step 2 — Home Feed Loads (CQRS Read Path)
+
+```
+Client → API Gateway → Catalog Service → Redis (NOT PostgreSQL) → Recommendation Service → Client
+```
+
+**Key Principle: The read path NEVER touches PostgreSQL. This is the CQRS pattern.**
+
+**Detailed Flow:**
+
+1. **Request:** `GET /v1/catalog/home?profileId=abc123`
+
+2. **L1 Cache Check (User's Personalized Feed):**
    ```
-   ZREVRANGE catalog:genre:{genreId} 0 19  (× 25 genres)
-   HGETALL title:meta:{titleId}            (× 500 titles)
+   Redis: GET home_feed:{profileId}
    ```
-4. Call Recommendation Service for personalization
-5. Cache result, return feed
+   - **HIT (30% of requests):** Return immediately in ~1ms, skip all steps below
+   - **MISS:** Continue to L2
 
-### Step 3 — Search
+3. **L2 — Fetch Genre Rows from Redis Sorted Sets:**
+   ```
+   Redis PIPELINE (single round trip for all 25 genres):
+     ZREVRANGE catalog:genre:action 0 19 WITHSCORES
+     ZREVRANGE catalog:genre:comedy 0 19 WITHSCORES
+     ZREVRANGE catalog:genre:drama 0 19 WITHSCORES
+     ... (25 total genres)
+   ```
+   - Returns top 20 titleIds per genre, already sorted by popularity score
+   - Total: 25 genres × 20 titles = 500 titleIds
 
-1. `GET /v1/search?q=stranger` → Search Service
-2. Query Elasticsearch with fuzzy matching
-3. Return ranked results
+4. **Hydrate Title Metadata:**
+   ```
+   Redis PIPELINE (single round trip for all titles):
+     HGETALL title:meta:title001
+     HGETALL title:meta:title002
+     ... (500 titles)
+   ```
+   - Each hash contains: `{title, rating, thumbnailUrl, contentType, releaseYear, maturityRating}`
 
-### Step 4 — Play Video
+5. **Fetch User Preferences:**
+   ```
+   Redis: HGETALL profile:prefs:{profileId}
+   ```
+   - Returns: `{action: 1.5, comedy: 0.8, drama: 1.2, ...}` (genre weights)
 
-**4a. Manifest Request:**
-1. `GET /v1/stream/{titleId}/manifest` → Streaming Service
-2. Check Redis cache for manifest
-3. If miss: build manifest, sign CDN URLs, get DRM tokens
-4. Cache in Redis (TTL 5m)
-5. Return manifest + resume position
+6. **Personalization (Recommendation Service):**
+   - Call Recommendation Service with user's watch history embedding
+   - Re-rank titles within each genre based on:
+     - User preference weights
+     - Collaborative filtering score
+     - Content-based similarity
+   - Add "Because You Watched X" row
+   - Apply A/B test variant (e.g., different row ordering)
 
-**4b. Video Playback:**
-1. Client requests DRM license
-2. License Server validates session, returns keys
-3. Client fetches chunks from Open Connect CDN
-4. ABR switches quality based on bandwidth
+7. **Fetch Continue Watching:**
+   ```
+   Redis: LRANGE continue:{profileId} 0 9
+   Redis: HGETALL resume:{profileId}
+   ```
+   - Get list of recently watched titles with progress
 
-### Step 5 — Progress Tracking
+8. **Assemble Final Feed:**
+   ```json
+   {
+     "rows": [
+       { "rowType": "continue_watching", "titles": [...] },
+       { "rowType": "trending", "titles": [...] },
+       { "rowType": "genre", "genreName": "Action", "titles": [...] },
+       { "rowType": "because_you_watched", "basedOn": "Stranger Things", "titles": [...] }
+     ],
+     "experimentId": "home_layout_v3"
+   }
+   ```
 
-Every 30 seconds:
+9. **Cache Personalized Feed:**
+   ```
+   Redis: SET home_feed:{profileId} {serializedFeed} EX 300
+   ```
+   - TTL 5 minutes — balances freshness vs cache hit rate
 
-1. `POST /v1/profiles/{profileId}/history` → Watch History Service
-2. **Write to Cassandra FIRST** (source of truth, CL=LOCAL_QUORUM)
-3. **Update Redis** (best effort cache)
-4. **Publish to Kafka** (fire-and-forget for analytics)
-5. Return `202 Accepted`
+10. **Return Response:** ~5-15ms total (vs 200-500ms if hitting PostgreSQL)
 
-### Step 6 — Trending (Async)
+**Why This Design:**
 
-1. Workers consume from Kafka
-2. `ZINCRBY trending:global:24h 1 {titleId}`
-3. User requests → `ZREVRANGE` returns top-K
+| Approach | Queries | Latency | DB Load at 17K QPS |
+|----------|---------|---------|-------------------|
+| Naive (PostgreSQL) | 25 JOINed SQL queries | 200-500ms | 425K queries/sec |
+| CQRS (Redis) | 2 pipelined Redis calls | 5-15ms | 0 SQL queries |
 
-### Step 7 — Catalog Update (CQRS Write Path)
+---
 
-1. Admin updates title → Catalog Service → PostgreSQL
-2. Publish `catalog-updated` to Kafka
-3. Workers rebuild Redis sorted sets + Elasticsearch
+### Step 3 — User Searches for Content
+
+```
+Client → API Gateway → Search Service → Elasticsearch → Client
+```
+
+**Detailed Flow:**
+
+1. **Request:** `GET /v1/search?q=stranger&page=1&size=20`
+
+2. **Query Preprocessing:**
+   - Lowercase: "stranger"
+   - Spell check: Check if "stranger" is misspelled (e.g., "straner" → "stranger")
+   - Tokenize for autocomplete
+
+3. **Elasticsearch Query:**
+   ```json
+   {
+     "query": {
+       "bool": {
+         "should": [
+           { "match": { "title": { "query": "stranger", "boost": 3.0, "fuzziness": "AUTO" } } },
+           { "match": { "actors": { "query": "stranger", "boost": 2.0 } } },
+           { "match": { "description": { "query": "stranger", "boost": 1.0 } } },
+           { "term": { "tags": { "value": "stranger", "boost": 1.5 } } }
+         ],
+         "filter": [
+           { "terms": { "region_availability": ["US"] } },
+           { "range": { "maturity_rating": { "lte": "TV-MA" } } }
+         ]
+       }
+     },
+     "suggest": {
+       "title-suggest": {
+         "prefix": "stranger",
+         "completion": { "field": "suggest", "size": 5 }
+       }
+     },
+     "from": 0,
+     "size": 20,
+     "sort": [
+       { "_score": "desc" },
+       { "popularity": "desc" }
+     ]
+   }
+   ```
+
+4. **Result Processing:**
+   - Extract titleIds from hits
+   - Fetch full metadata from Redis (if needed)
+   - Highlight matched terms in title
+
+5. **Response:**
+   ```json
+   {
+     "results": [
+       { "titleId": "t001", "title": "Stranger Things", "matchScore": 95.2, "highlightedTitle": "<em>Stranger</em> Things" },
+       { "titleId": "t002", "title": "The Stranger", "matchScore": 87.1 }
+     ],
+     "suggestions": ["stranger things", "stranger 2020"],
+     "spellCheck": null,
+     "pagination": { "page": 1, "totalPages": 3, "totalItems": 47 }
+   }
+   ```
+
+**Why Elasticsearch over PostgreSQL LIKE:**
+- Fuzzy matching (handles typos)
+- Relevance scoring (not just matching)
+- Autocomplete suggestions
+- 30K QPS with sub-100ms latency
+
+---
+
+### Step 4 — User Clicks Play (Streaming)
+
+```
+Client → API Gateway → Streaming Service → Redis/S3 → License Server → Client
+Client → Open Connect CDN → S3 (origin)
+```
+
+**4a. Manifest Request (What happens when you click play):**
+
+1. **Request:** `GET /v1/stream/{titleId}/manifest?profileId=abc&episodeId=ep01`
+
+2. **Entitlement Check:**
+   - Verify subscription is active (call User Service or check JWT claims)
+   - Verify content is available in user's region
+   - Check concurrent stream limit (max 4 screens)
+
+3. **Check Manifest Cache:**
+   ```
+   Redis: GET manifest:{titleId}
+   ```
+   - **HIT:** Return cached manifest (90% of requests)
+   - **MISS:** Build manifest
+
+4. **Build Manifest (on cache miss):**
+   
+   a. **Fetch manifest template from S3:**
+   ```
+   S3: GET s3://netflix-manifests/{titleId}/master.m3u8
+   ```
+   
+   b. **Generate signed CDN URLs:**
+   ```
+   For each resolution (480p, 720p, 1080p, 4K):
+     signedUrl = sign(cdnUrl, secretKey, expiry=5min)
+   ```
+   
+   c. **Get DRM license URLs:**
+   ```
+   widevine: https://license.netflix.com/widevine/{titleId}
+   fairplay: https://license.netflix.com/fairplay/{titleId}
+   playready: https://license.netflix.com/playready/{titleId}
+   ```
+
+5. **Fetch Resume Position:**
+   ```
+   Redis: HGET resume:{profileId} {titleId}
+   ```
+   - Returns: `{episodeId: "ep01", progressSec: 1847, updatedAt: "..."}`
+
+6. **Cache Manifest:**
+   ```
+   Redis: SET manifest:{titleId} {manifestJson} EX 300
+   ```
+
+7. **Response:**
+   ```json
+   {
+     "playbackId": "pb-uuid-123",
+     "manifestUrl": "https://oc.netflix.com/signed/title123/master.m3u8?token=xxx&expires=1709900000",
+     "drmConfig": {
+       "widevine": { "licenseUrl": "https://license.netflix.com/widevine/title123", "certificateUrl": "..." },
+       "fairplay": { "licenseUrl": "https://license.netflix.com/fairplay/title123", "certificateUrl": "..." }
+     },
+     "resumePositionSec": 1847,
+     "expiresAt": "2026-02-26T12:05:00Z",
+     "availableQualities": ["480p", "720p", "1080p", "4K"]
+   }
+   ```
+
+**4b. What is a Manifest?**
+
+A manifest is a playlist file that tells the video player which chunks to fetch:
+
+```
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+https://oc.netflix.com/title123/360p/playlist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+https://oc.netflix.com/title123/720p/playlist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+https://oc.netflix.com/title123/1080p/playlist.m3u8
+```
+
+Each quality level has its own playlist listing 4-second chunks:
+```
+#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXTINF:4.0,
+https://oc.netflix.com/title123/1080p/chunk_001.ts
+#EXTINF:4.0,
+https://oc.netflix.com/title123/1080p/chunk_002.ts
+```
+
+**4c. DRM License Acquisition:**
+
+1. **Client requests license:**
+   ```
+   POST https://license.netflix.com/widevine/title123
+   Body: { challenge: <encrypted_challenge>, sessionToken: <jwt> }
+   ```
+
+2. **License Server validates:**
+   - JWT signature and expiry
+   - User's subscription tier (Basic: 480p, Standard: 1080p, Premium: 4K)
+   - Device security level (Widevine L1 = hardware, L3 = software)
+
+3. **License Server responds:**
+   - Returns encrypted content keys
+   - Keys valid for 24 hours (offline) or session duration (streaming)
+
+**4d. Video Chunk Fetching (ABR - Adaptive Bitrate):**
+
+1. **Client parses manifest**
+2. **Initial quality selection:** Based on detected bandwidth, start at appropriate quality
+3. **Fetch chunks from Open Connect CDN:**
+   ```
+   GET https://oc.netflix.com/title123/1080p/chunk_001.ts
+   ```
+
+4. **CDN Routing (Open Connect):**
+   - Steering Service determines optimal OCA (Open Connect Appliance)
+   - OCA in user's ISP serves chunk (~95% cache hit rate)
+   - On miss: OCA fetches from regional hub → S3 origin
+
+5. **Adaptive Bitrate Switching:**
+   - Client monitors download speed and buffer health
+   - If bandwidth drops: switch to lower quality (720p → 480p)
+   - If bandwidth improves: switch to higher quality (720p → 1080p)
+   - Seamless switching happens at chunk boundaries
+
+**4e. Heartbeat (Every 30 seconds during playback):**
+
+```
+POST /v1/stream/{playbackId}/heartbeat
+{ currentPositionSec: 1890, bitrateKbps: 5000, bufferHealthSec: 30, quality: "1080p" }
+```
+
+- Validates session is still active
+- Updates `playback:{playbackId}` TTL in Redis
+- Feeds real-time analytics (concurrent viewers, quality distribution)
+- Returns `{ continue: true }` or `{ continue: false, reason: "concurrent_limit" }`
+
+---
+
+### Step 5 — Progress Tracking (Watch History)
+
+```
+Client → API Gateway → Watch History Service → Cassandra → Redis → Kafka
+```
+
+**When it happens:** Every 30 seconds during playback + on pause/exit
+
+**Detailed Flow:**
+
+1. **Request:** 
+   ```
+   POST /v1/profiles/{profileId}/history
+   {
+     "titleId": "title123",
+     "episodeId": "ep01",
+     "progressSec": 1890,
+     "durationSec": 3600,
+     "timestamp": "2026-02-26T10:30:00Z",
+     "completed": false
+   }
+   ```
+
+2. **Step 1 — Write to Cassandra FIRST (Source of Truth):**
+   ```sql
+   -- Write to watch_progress (for resume)
+   INSERT INTO watch_progress (profile_id, title_id, episode_id, progress_sec, duration_sec, updated_at)
+   VALUES (?, ?, ?, ?, ?, ?)
+   USING TTL 63072000;  -- 2 years
+   
+   -- Write to watch_history (for history list)
+   INSERT INTO watch_history (profile_id, year_month, watched_at, title_id, episode_id, progress_sec, duration_sec, completed)
+   VALUES (?, '2026-02', ?, ?, ?, ?, ?, ?);
+   ```
+   - Consistency Level: LOCAL_QUORUM (2 of 3 replicas must acknowledge)
+   - **If Cassandra write fails:** Return 503, client retries with exponential backoff
+   - **If Cassandra write succeeds:** Continue to next steps
+
+3. **Step 2 — Update Redis Cache (Best Effort):**
+   ```
+   HSET resume:{profileId} {titleId} '{"episodeId":"ep01","progressSec":1890,"updatedAt":"..."}'
+   
+   -- Update continue watching list (most recent first)
+   LREM continue:{profileId} 0 {titleId}  -- Remove if exists
+   LPUSH continue:{profileId} {titleId}   -- Add to front
+   LTRIM continue:{profileId} 0 19        -- Keep only 20 items
+   ```
+   - **If Redis fails:** Log error, DO NOT fail the request
+   - Background reconciliation job rebuilds cache from Cassandra if needed
+
+4. **Step 3 — Publish to Kafka (Fire and Forget):**
+   ```json
+   Topic: watch-events
+   Key: profileId (ensures ordering per user)
+   Value: {
+     "eventType": "PROGRESS",
+     "profileId": "abc123",
+     "titleId": "title123",
+     "episodeId": "ep01",
+     "progressSec": 1890,
+     "timestamp": "2026-02-26T10:30:00Z",
+     "deviceType": "web",
+     "quality": "1080p"
+   }
+   ```
+   - Producer acks: 1 (leader only — acceptable for analytics)
+   - **If Kafka publish fails:** Log error, continue (analytics can tolerate gaps)
+
+5. **Response:** `202 Accepted` with `{ "recorded": true }`
+
+**Why This Order (Cassandra → Redis → Kafka):**
+
+| Store | Role | Failure Impact |
+|-------|------|----------------|
+| Cassandra | Source of truth | Must succeed, retry if fails |
+| Redis | Read cache | Can rebuild from Cassandra |
+| Kafka | Analytics | Can tolerate gaps |
+
+---
+
+### Step 6 — Trending Computation (Async Workers)
+
+```
+Kafka → Trending Workers → Redis Sorted Sets
+```
+
+**Detailed Flow:**
+
+1. **Kafka Consumer Group:** `trending-workers` (10 consumers, 64 partitions)
+
+2. **For each watch event:**
+   ```
+   Redis PIPELINE:
+     ZINCRBY trending:global:24h 1 {titleId}
+     ZINCRBY trending:{genreId}:24h 1 {titleId}
+     ZINCRBY trending:{region}:24h 1 {titleId}
+   ```
+
+3. **Sliding Window Implementation:**
+   - Separate sorted sets for each window: `trending:global:1h`, `trending:global:24h`, `trending:global:7d`
+   - Each set has TTL slightly longer than window (e.g., 25h for 24h window)
+   - Old events naturally expire
+
+4. **When User Requests Trending:**
+   ```
+   GET /v1/trending?window=24h&genre=action&region=US
+   
+   Redis: ZREVRANGE trending:action:24h 0 49 WITHSCORES
+   ```
+   - Returns top 50 titles with view counts
+   - O(log N + K) complexity where K = result size
+
+5. **Movement Calculation (Optional):**
+   - Compare current rank with rank 1 hour ago
+   - Add "↑5" or "↓3" movement indicators
+
+---
+
+### Step 7 — Content Ingestion (Admin/Async)
+
+```
+S3 Upload → Transcoding Pipeline → S3 → Kafka → Workers → Redis/Elasticsearch/CDN
+```
+
+**Detailed Flow:**
+
+1. **Admin Uploads Video:**
+   - Upload raw video file to `s3://netflix-ingest/{titleId}/source.mp4`
+   - Upload metadata JSON
+
+2. **Transcoding Pipeline Triggered:**
+   ```
+   Input: source.mp4 (4K master)
+   
+   Outputs (24 variants):
+   - 4 resolutions: 480p, 720p, 1080p, 4K
+   - 2 codecs: H.264 (compatibility), H.265/HEVC (quality)
+   - 3 audio: Stereo, 5.1 Surround, Dolby Atmos
+   
+   For each variant:
+     - Split into 4-second chunks
+     - Encrypt with DRM keys
+     - Generate manifest file
+   ```
+
+3. **Store Encoded Content:**
+   ```
+   S3 Structure:
+   s3://netflix-videos/{titleId}/
+     ├── 480p_h264/
+     │   ├── playlist.m3u8
+     │   ├── chunk_001.ts
+     │   ├── chunk_002.ts
+     │   └── ...
+     ├── 1080p_h265/
+     │   └── ...
+     └── master.m3u8
+   ```
+
+4. **Publish content-ready Event:**
+   ```json
+   Topic: catalog-updates
+   {
+     "eventType": "CONTENT_READY",
+     "titleId": "title123",
+     "variants": ["480p_h264", "720p_h264", "1080p_h264", "1080p_h265", "4k_h265"],
+     "duration": 7200,
+     "timestamp": "2026-02-26T10:00:00Z"
+   }
+   ```
+
+5. **Workers Process Event:**
+   
+   a. **Search Indexer:** Update Elasticsearch with new title
+   
+   b. **Cache Invalidator:** 
+   ```
+   Redis: DEL title:meta:{titleId}
+   Redis: Update catalog:genre:{genreId} sorted sets
+   ```
+   
+   c. **Open Connect Proactive Fill:**
+   - Predict popularity based on similar titles
+   - Push to OCAs in relevant regions overnight
+   
+   d. **Recommendation Service:**
+   - Generate content embedding from metadata
+   - Update similarity matrices
+
+---
+
+### Step 8 — Catalog Update (CQRS Write Path)
+
+```
+Admin API → Catalog Service → PostgreSQL → Kafka → Workers → Redis/Elasticsearch
+```
+
+**When:** Admin updates title metadata (title, description, cast, genres)
+
+**Detailed Flow:**
+
+1. **Admin Request:**
+   ```
+   PUT /v1/admin/titles/{titleId}
+   {
+     "title": "Stranger Things Season 5",
+     "description": "Updated description...",
+     "releaseYear": 2026,
+     "genres": ["scifi", "horror", "drama"]
+   }
+   ```
+
+2. **Write to PostgreSQL (Source of Truth):**
+   ```sql
+   BEGIN TRANSACTION;
+   
+   UPDATE titles SET title = ?, description = ?, release_year = ?, updated_at = NOW()
+   WHERE title_id = ?;
+   
+   DELETE FROM title_genres WHERE title_id = ?;
+   INSERT INTO title_genres (title_id, genre_id) VALUES (?, ?), (?, ?), (?, ?);
+   
+   COMMIT;
+   ```
+
+3. **Publish catalog-updated Event:**
+   ```json
+   Topic: catalog-updates
+   Key: titleId
+   {
+     "eventType": "METADATA_UPDATED",
+     "titleId": "title123",
+     "changedFields": ["title", "description", "genres"],
+     "timestamp": "2026-02-26T11:00:00Z"
+   }
+   ```
+
+4. **Cache Invalidator Worker:**
+   ```
+   -- Update title metadata hash
+   Redis: HSET title:meta:{titleId} title "Stranger Things Season 5" description "..." ...
+   
+   -- Remove from old genre sorted sets
+   Redis: ZREM catalog:genre:action {titleId}
+   
+   -- Add to new genre sorted sets
+   Redis: ZADD catalog:genre:scifi {popularityScore} {titleId}
+   Redis: ZADD catalog:genre:horror {popularityScore} {titleId}
+   Redis: ZADD catalog:genre:drama {popularityScore} {titleId}
+   
+   -- Invalidate affected home feeds (pattern delete)
+   -- Note: Only invalidate, don't rebuild — feeds rebuild on next request
+   Redis: DEL home_feed:* (or use TTL expiry)
+   ```
+
+5. **Search Indexer Worker:**
+   ```
+   Elasticsearch: Update document in 'titles' index
+   ```
+
+6. **Propagation Time:** ~1-2 seconds from PostgreSQL write to Redis/ES update
+
+**CQRS Summary:**
+
+```
+WRITE PATH (rare, few times/day):
+  Admin → Catalog Service → PostgreSQL → Kafka → Worker → Redis + Elasticsearch
+
+READ PATH (17K QPS):
+  Client → Catalog Service → Redis (sorted sets + hashes) → Client
+  
+  PostgreSQL is NEVER queried on the read path!
+```
+
+---
+
+### Step 9 — Recommendation Generation (ML Pipeline)
+
+```
+Kafka → Spark → Feature Store → Model Training → Model Serving → Recommendation Service
+```
+
+**Offline Pipeline (runs daily):**
+
+1. **Data Collection:**
+   - Consume watch-events from Kafka into Data Lake (S3 + Spark)
+   - Aggregate: views per title, completion rates, user-title interactions
+
+2. **Feature Engineering:**
+   ```
+   User Features:
+   - watch_history_embedding (128 dims) — from last 100 watched titles
+   - genre_affinity_vector (25 dims) — weighted by watch time
+   - avg_session_length, preferred_time_of_day
+   
+   Title Features:
+   - content_embedding (256 dims) — from description, cast, genre
+   - popularity_score, avg_completion_rate
+   - similar_titles_list
+   ```
+
+3. **Model Training:**
+   - Collaborative Filtering (ALS): User-item interaction matrix
+   - Content-Based (Deep NN): Title embeddings + user taste profile
+   - Sequence Model (Transformer): Predict next title from watch sequence
+
+4. **Model Deployment:**
+   - Export to Model Registry
+   - Deploy to Model Serving infrastructure (TensorFlow Serving / Triton)
+
+**Online Serving (real-time):**
+
+1. **Request:** `GET /v1/profiles/{profileId}/recommendations`
+
+2. **Feature Retrieval:**
+   ```
+   Feature Store: Get user_embedding for profileId
+   Feature Store: Get title_embeddings for candidate titles
+   ```
+
+3. **Candidate Generation:**
+   - ALS: Find similar users, get their top titles
+   - Content-based: Find titles similar to user's favorites
+   - Sequence: Predict likely next titles
+
+4. **Ranking:**
+   - Combine scores from all models
+   - Apply business rules (boost new releases, ensure diversity)
+   - Filter by availability, maturity rating
+
+5. **Cache Result:**
+   ```
+   Redis: SET recs:{profileId} {recsJson} EX 3600
+   ```
+
+---
+
+### Step 10 — A/B Test Assignment
+
+```
+Client → API Gateway → Experiment Service → Redis → Client (with variant config)
+```
+
+**Detailed Flow:**
+
+1. **On any request requiring experiment:**
+   ```
+   Experiment Service: getVariant(userId, experimentId)
+   ```
+
+2. **Check existing assignment:**
+   ```
+   Redis: HGET experiment:home_layout_v3:assignments {userId}
+   ```
+   - **If exists:** Return cached variant
+
+3. **New Assignment (deterministic):**
+   ```python
+   bucket = hash(userId + experimentId) % 100
+   
+   if bucket < 50:
+       variant = "control"
+   elif bucket < 75:
+       variant = "treatment_a"
+   else:
+       variant = "treatment_b"
+   ```
+
+4. **Store Assignment:**
+   ```
+   Redis: HSET experiment:home_layout_v3:assignments {userId} {variant}
+   ```
+
+5. **Return Variant Config:**
+   ```json
+   {
+     "experimentId": "home_layout_v3",
+     "variant": "treatment_a",
+     "config": { "rowOrder": "trending_first" }
+   }
+   ```
+
+6. **Metrics Collection:**
+   - All events tagged with experimentId + variant
+   - Kafka → Spark aggregation → Statistical analysis
+   - Dashboard shows conversion rates per variant
 
 ---
 
