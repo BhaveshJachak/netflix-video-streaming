@@ -597,7 +597,270 @@ Client → API Gateway → Catalog Service → Redis (NOT PostgreSQL) → Recomm
 
 **Key Principle: The read path NEVER touches PostgreSQL. This is the CQRS pattern.**
 
-**Detailed Flow:**
+---
+
+#### 2.1 How Redis Gets Updated (Write Path - Background)
+
+Before we discuss the read path, let's understand **how data gets INTO Redis** in the first place.
+
+**Redis is NOT a cache in traditional sense — it's the PRIMARY READ STORE.**
+
+```
+WRITE PATH (runs when catalog changes):
+
+Admin updates title
+        │
+        ▼
+┌─────────────────┐
+│ Catalog Service │
+│   (Write API)   │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│   PostgreSQL    │  ← Source of Truth (normalized, ACID)
+│    (Write)      │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│     Kafka       │  ← Event: "catalog-updated"
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Cache Builder  │  ← Background Worker
+│    Worker       │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│     Redis       │  ← Denormalized, optimized for reads
+│  (Read Store)   │
+└─────────────────┘
+```
+
+---
+
+#### 2.2 Cache Builder Worker — The Key Component
+
+This worker **transforms normalized PostgreSQL data into denormalized Redis structures**.
+
+**When it runs:**
+- On every `catalog-updated` Kafka event
+- Scheduled full rebuild every 6 hours (consistency check)
+- On startup/deployment
+
+**What it does:**
+
+```python
+# CACHE BUILDER WORKER
+
+def handle_catalog_update(event):
+    """
+    Triggered by Kafka event when admin updates catalog
+    """
+    title_id = event['titleId']
+    event_type = event['eventType']  # CREATED | UPDATED | DELETED
+    
+    if event_type == 'DELETED':
+        delete_title_from_redis(title_id)
+    else:
+        rebuild_title_in_redis(title_id)
+
+
+def rebuild_title_in_redis(title_id):
+    """
+    Fetch from PostgreSQL, transform, write to Redis
+    """
+    
+    # STEP 1: Fetch from PostgreSQL (Source of Truth)
+    title = db.query("""
+        SELECT t.title_id, t.title, t.rating, t.thumbnail_url, 
+               t.content_type, t.release_year, t.popularity_score,
+               array_agg(g.genre_id) as genres
+        FROM titles t
+        JOIN title_genres tg ON t.title_id = tg.title_id
+        JOIN genres g ON tg.genre_id = g.genre_id
+        WHERE t.title_id = %s
+        GROUP BY t.title_id
+    """, [title_id])
+    
+    # STEP 2: Update title metadata hash
+    redis.hset(f"title:meta:{title_id}", mapping={
+        "title": title.title,
+        "rating": title.rating,
+        "thumbnailUrl": title.thumbnail_url,
+        "contentType": title.content_type,
+        "releaseYear": title.release_year
+    })
+    
+    # STEP 3: Update genre sorted sets
+    for genre_id in title.genres:
+        # Score = popularity (higher = shown first)
+        redis.zadd(
+            f"catalog:genre:{genre_id}",
+            {title_id: title.popularity_score}
+        )
+    
+    # STEP 4: Invalidate user home feeds (they'll rebuild on next request)
+    # Option A: Delete all (simple but expensive)
+    # Option B: Let TTL expire naturally (5 min)
+    # Option C: Publish invalidation event for affected users
+    
+
+def rebuild_full_catalog():
+    """
+    Full rebuild - runs every 6 hours or on deployment
+    """
+    
+    # STEP 1: Fetch ALL titles from PostgreSQL
+    titles = db.query("""
+        SELECT t.*, array_agg(tg.genre_id) as genres
+        FROM titles t
+        JOIN title_genres tg ON t.title_id = tg.title_id
+        GROUP BY t.title_id
+    """)
+    
+    # STEP 2: Clear old Redis data
+    for genre_id in get_all_genres():
+        redis.delete(f"catalog:genre:{genre_id}")
+    
+    # STEP 3: Rebuild all structures
+    pipeline = redis.pipeline()
+    
+    for title in titles:
+        # Title metadata
+        pipeline.hset(f"title:meta:{title.title_id}", mapping={
+            "title": title.title,
+            "rating": title.rating,
+            "thumbnailUrl": title.thumbnail_url,
+            "contentType": title.content_type,
+            "releaseYear": title.release_year
+        })
+        
+        # Genre sorted sets
+        for genre_id in title.genres:
+            pipeline.zadd(
+                f"catalog:genre:{genre_id}",
+                {title.title_id: title.popularity_score}
+            )
+    
+    # STEP 4: Execute all commands in one batch
+    pipeline.execute()
+    
+    print(f"Rebuilt {len(titles)} titles in Redis")
+```
+
+---
+
+#### 2.3 Redis Data Structures (What Gets Built)
+
+**Structure 1: Genre Sorted Sets**
+
+```
+Key: catalog:genre:action
+Type: Sorted Set
+Score: popularity_score (higher = more popular)
+
+┌─────────────┬───────────────┐
+│   titleId   │     score     │
+├─────────────┼───────────────┤
+│  title_001  │    95000.0    │  ← Most popular action title
+│  title_042  │    87500.0    │
+│  title_107  │    82300.0    │
+│  title_023  │    79100.0    │
+│     ...     │      ...      │
+│  title_892  │     1200.0    │  ← Least popular
+└─────────────┴───────────────┘
+
+Commands:
+  ZADD catalog:genre:action 95000 title_001    # Add/update
+  ZREVRANGE catalog:genre:action 0 19          # Get top 20
+  ZREM catalog:genre:action title_001          # Remove
+```
+
+**Structure 2: Title Metadata Hashes**
+
+```
+Key: title:meta:title_001
+Type: Hash
+
+┌─────────────────┬──────────────────────────────┐
+│      field      │            value             │
+├─────────────────┼──────────────────────────────┤
+│  title          │  "Stranger Things"           │
+│  rating         │  "8.7"                       │
+│  thumbnailUrl   │  "https://cdn.../thumb.jpg"  │
+│  contentType    │  "SERIES"                    │
+│  releaseYear    │  "2016"                      │
+│  maturityRating │  "TV-14"                     │
+└─────────────────┴──────────────────────────────┘
+
+Commands:
+  HSET title:meta:title_001 title "Stranger Things" rating "8.7" ...
+  HGETALL title:meta:title_001    # Get all fields
+  HGET title:meta:title_001 title # Get single field
+```
+
+**Structure 3: User Home Feed Cache**
+
+```
+Key: home_feed:profile_abc123
+Type: String (JSON)
+TTL: 300 seconds (5 minutes)
+
+Value: {
+  "rows": [
+    {
+      "rowType": "continue_watching",
+      "titles": [{"titleId": "t1", "title": "...", "progress": 45}]
+    },
+    {
+      "rowType": "genre",
+      "genreId": "action", 
+      "genreName": "Action",
+      "titles": [{"titleId": "t2", "title": "...", "matchScore": 95}]
+    }
+  ],
+  "generatedAt": "2026-02-26T10:00:00Z",
+  "experimentId": "home_v3"
+}
+
+Commands:
+  SET home_feed:profile_abc123 '{...}' EX 300
+  GET home_feed:profile_abc123
+```
+
+---
+
+#### 2.4 The Complete CQRS Flow (Visual)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              WRITE PATH                                      │
+│                         (When catalog changes)                               │
+│                                                                              │
+│  Admin ──▶ Catalog Service ──▶ PostgreSQL ──▶ Kafka ──▶ Cache Builder ──▶ Redis
+│                                    │                         │               │
+│                              (Source of                 (Transforms    (Denormalized
+│                               Truth)                     data)          Read Store)
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              READ PATH                                       │
+│                         (When user loads feed)                               │
+│                                                                              │
+│  Client ──▶ Catalog Service ──▶ Redis ──▶ Client                            │
+│                                   │                                          │
+│                            (PostgreSQL is                                    │
+│                             NEVER touched)                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 2.5 Detailed Read Flow (Now That You Know How Redis is Populated)
 
 1. **Request:** `GET /v1/catalog/home?profileId=abc123`
 
@@ -618,6 +881,7 @@ Client → API Gateway → Catalog Service → Redis (NOT PostgreSQL) → Recomm
    ```
    - Returns top 20 titleIds per genre, already sorted by popularity score
    - Total: 25 genres × 20 titles = 500 titleIds
+   - **This data was pre-built by Cache Builder Worker!**
 
 4. **Hydrate Title Metadata:**
    ```
@@ -627,6 +891,7 @@ Client → API Gateway → Catalog Service → Redis (NOT PostgreSQL) → Recomm
      ... (500 titles)
    ```
    - Each hash contains: `{title, rating, thumbnailUrl, contentType, releaseYear, maturityRating}`
+   - **This data was pre-built by Cache Builder Worker!**
 
 5. **Fetch User Preferences:**
    ```
@@ -670,6 +935,60 @@ Client → API Gateway → Catalog Service → Redis (NOT PostgreSQL) → Recomm
    - TTL 5 minutes — balances freshness vs cache hit rate
 
 10. **Return Response:** ~5-15ms total (vs 200-500ms if hitting PostgreSQL)
+
+---
+
+#### 2.6 Why Not Just Use PostgreSQL with Caching?
+
+| Approach | Problem |
+|----------|---------|
+| **PostgreSQL + Simple Cache** | Cache miss = slow query, cache stampede on expiry |
+| **PostgreSQL + Read Replicas** | Still doing JOINs, still slow at 17K QPS |
+| **Redis as Cache (TTL-based)** | Data expires, miss = hit PostgreSQL |
+| **Redis as Read Store (CQRS)** | ✅ Data always present, never hit PostgreSQL on reads |
+
+**CQRS Advantages:**
+1. **No cache miss** — Redis always has data (background sync)
+2. **No JOIN queries** — Data pre-denormalized
+3. **No thundering herd** — TTL expiry doesn't cause DB spike
+4. **Independent scaling** — Read and write paths scale separately
+
+---
+
+#### 2.7 What Happens When PostgreSQL and Redis Are Out of Sync?
+
+**Scenario:** Admin updates title, but Kafka/Worker fails before Redis update
+
+**Detection:**
+- Scheduled consistency checker (every 6 hours)
+- Compares PostgreSQL row counts and checksums with Redis
+
+**Resolution:**
+- Full rebuild triggered automatically
+- Alert sent to ops team
+
+**User Impact:**
+- Stale data for max 6 hours (acceptable for catalog)
+- Critical paths (auth, payments) use strong consistency, not CQRS
+
+```python
+# Consistency Checker (runs every 6 hours)
+def check_consistency():
+    pg_count = db.query("SELECT COUNT(*) FROM titles")[0]
+    
+    redis_count = 0
+    for genre in get_all_genres():
+        redis_count += redis.zcard(f"catalog:genre:{genre}")
+    
+    # Dedupe since titles can be in multiple genres
+    redis_titles = set()
+    for genre in get_all_genres():
+        redis_titles.update(redis.zrange(f"catalog:genre:{genre}", 0, -1))
+    
+    if len(redis_titles) != pg_count:
+        alert("Redis/PostgreSQL mismatch!")
+        trigger_full_rebuild()
+```
 
 **Why This Design:**
 
