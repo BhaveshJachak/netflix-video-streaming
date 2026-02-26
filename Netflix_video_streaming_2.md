@@ -521,23 +521,23 @@ ratelimit:{endpoint}:{id}        → COUNT                               TTL var
 
 ```mermaid
 flowchart TD
-    subgraph Clients["👤 Clients"]
-        C["Mobile · Web · Smart TV"]
+    subgraph Clients
+        C["Client<br/>Mobile · Web · Smart TV"]
     end
 
-    subgraph Edge["🌐 Edge Layer"]
+    subgraph Edge
         DNS["GeoDNS"]
         WAF["WAF + DDoS"]
         CDN["Open Connect CDN<br/>(ISP Appliances)"]
     end
 
-    subgraph Gateway["🚪 API Gateway Layer"]
+    subgraph Gateway
         RL["Rate Limiter"]
         GW["API Gateway"]
         LB["Load Balancer"]
     end
 
-    subgraph Services["⚙️ Services"]
+    subgraph Services
         AUTH["Auth"]
         USER["User"]
         CATALOG["Catalog"]
@@ -547,14 +547,14 @@ flowchart TD
         REC["Recommendation"]
     end
 
-    subgraph Cache["⚡ Redis Cluster"]
+    subgraph Cache["Redis Cluster"]
         R_SESSION["Sessions"]
         R_CATALOG["Catalog Cache<br/>(Sorted Sets)"]
         R_TRENDING["Trending"]
         R_RESUME["Resume Progress"]
     end
 
-    subgraph DB["🗄️ Databases"]
+    subgraph DB["Databases"]
         PG_USER["PostgreSQL<br/>(Users)"]
         PG_CATALOG["PostgreSQL<br/>(Catalog)"]
         CASS["Cassandra<br/>(Watch History)"]
@@ -562,69 +562,49 @@ flowchart TD
         S3["S3 (Videos)"]
     end
 
-    subgraph Async["📨 Async Layer"]
+    subgraph Async
         KAFKA["Kafka"]
         WORKERS["Workers<br/>(Trending · Cache · ML)"]
     end
 
-    subgraph ML["🤖 ML Platform"]
+    subgraph ML["ML Platform"]
         FEATURE["Feature Store"]
         MODEL["Model Serving"]
     end
 
-    subgraph DRM["🔐 DRM"]
+    subgraph DRM
         LICENSE["License Server<br/>(Widevine · FairPlay)"]
     end
 
-    %% Client Flow
     C --> DNS
     C -->|"Video Chunks"| CDN
     C --> WAF --> RL --> GW --> LB
 
-    %% API to Services
     LB --> AUTH & USER & CATALOG & SEARCH & STREAM & HISTORY
 
-    %% Auth Flow
     AUTH --> R_SESSION
     AUTH --> PG_USER
     USER --> PG_USER
 
-    %% Catalog Flow (CQRS)
     CATALOG -->|"READ"| R_CATALOG
     CATALOG -->|"WRITE"| PG_CATALOG
     CATALOG --> REC
 
-    %% Search Flow
     SEARCH --> ES
 
-    %% Streaming Flow
     STREAM --> LICENSE
     STREAM --> CDN
     CDN --> S3
 
-    %% Watch History Flow
     HISTORY -->|"1. Write First"| CASS
     HISTORY -->|"2. Update Cache"| R_RESUME
     HISTORY -->|"3. Publish"| KAFKA
 
-    %% Async Processing
     KAFKA --> WORKERS
     WORKERS --> R_CATALOG & R_TRENDING & ES
 
-    %% ML Flow
     WORKERS --> FEATURE
     REC --> FEATURE & MODEL
-
-    %% Styling
-    style Clients fill:#e3f2fd
-    style Edge fill:#fff3e0
-    style Gateway fill:#f3e5f5
-    style Services fill:#e8f5e9
-    style Cache fill:#ffebee
-    style DB fill:#fce4ec
-    style Async fill:#fff8e1
-    style ML fill:#f1f8e9
-    style DRM fill:#efebe9
 ```
 
 ---
