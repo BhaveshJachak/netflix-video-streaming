@@ -385,7 +385,7 @@ CREATE TABLE watch_history (
 CREATE TABLE watch_progress (
   user_id       UUID,
   title_id      UUID,
-  episode_id    UUID,
+  episode_id      UUID,
   progress_sec  INT,
   duration_sec  INT,
   updated_at    TIMESTAMP,
@@ -396,12 +396,26 @@ CREATE TABLE watch_progress (
 ### Redis Key Patterns
 
 ```
+--- Session & Auth ---
 session:{sessionId}            → JSON {userId, roles}              TTL 1h
+
+--- Catalog Read Path (CQRS — pre-built by Write Path) ---
+catalog:genre:{genreId}        → SORTED SET {titleId → score}      NO TTL (updated by write path)
+title:meta:{titleId}           → HASH {title, rating, thumbnailUrl, contentType, releaseYear}
+user:prefs:{userId}            → HASH {genreId → weight}           TTL 7d
 home_feed:{userId}             → JSON {serialized feed}            TTL 5m
+
+--- Streaming ---
 manifest:{titleId}             → JSON {manifest data}              TTL 5m
+
+--- Watch History ---
 resume:{userId}                → HASH {titleId → progressSec}      TTL 7d
+
+--- Trending ---
 trending:global:24h            → SORTED SET {titleId → score}      TTL 24h
 trending:{genreId}:24h         → SORTED SET {titleId → score}      TTL 24h
+
+--- Recommendations ---
 recs:{userId}                  → JSON {recommendation results}     TTL 1h
 ```
 
@@ -458,8 +472,8 @@ flowchart TD
     AS --> R1["Redis\nSession"]
     AS --> PG["PostgreSQL\nUsers · Catalog"]
     US --> PG
-    CS --> PG
-    CS --> R2["Redis\nCache"]
+    CS -->|"READ PATH\nZREVRANGE per genre"| R2["Redis\nCatalog Cache\nSorted Sets · Hashes"]
+    CS -->|"WRITE PATH only"| PG
     CS --> REC["Recommendation"]
     SS --> ES["Elasticsearch"]
     ST --> S3["S3\nVideo Storage"]
@@ -471,6 +485,7 @@ flowchart TD
     WH -.-> K["Kafka"]
 
     K -.-> W["Workers\nTrending · ML"]
+    W -.-> R2
     W -.-> R3
     W -.-> ES
     W -.-> REC
@@ -489,12 +504,32 @@ flowchart TD
 - Auth checks Redis session cache → on miss, verifies creds in PostgreSQL
 - Returns JWT token
 
-### Step 2 — Home Feed Loads
+### Step 2 — Home Feed Loads (READ PATH — CQRS)
+
+**Key design: The read path NEVER touches PostgreSQL. All M genres × N titles are served from Redis.**
 
 - `GET /catalog/home?userId={id}` → Catalog Service
-- Check Redis feed cache (TTL 5 min) → on hit, return immediately
-- On miss: call Recommendation Service for ranking weights + query PostgreSQL for titles per genre
-- Assemble personalized feed, cache in Redis, return
+- **Check L1 cache:** Redis `GET home_feed:{userId}` (TTL 5 min)
+  - **HIT** → return immediately (~1ms, zero DB load)
+  - **MISS** → continue to L2 below
+- **L2 — Fetch from Redis sorted sets (NOT PostgreSQL):**
+  - Redis PIPELINE: `ZREVRANGE catalog:genre:{genreId} 0 19` for all 25 genres in parallel
+  - This returns top 20 titleIds per genre, pre-sorted by score
+  - Redis PIPELINE: `HGETALL title:meta:{titleId}` for all 25 × 20 = 500 titleIds in one batch round trip
+  - Redis: `HGETALL user:prefs:{userId}` → user's genre preference weights
+- **Re-rank:** Re-order titles within each genre using user preference weights from Recommendation Service
+- **Cache result:** `SET home_feed:{userId}` with TTL 5 min
+- **Return** assembled personalized feed to client
+
+**Why this matters (interview differentiator):**
+
+| Aspect | Naive (hit PostgreSQL) | CQRS (read from Redis) |
+|--------|----------------------|----------------------|
+| Queries per feed request | 25 JOINed SQL queries | 1 Redis GET (cache hit) or 26 ZREVRANGE (cache miss) |
+| Latency | 200-500ms | 1-5ms |
+| PostgreSQL load at 17K QPS | 425,000 SQL queries/sec | ~0 SQL queries (write path only) |
+| PostgreSQL role | Read + Write | Write only (source of truth) |
+| Redis role | Simple TTL cache | Primary read store (denormalized, pre-built) |
 
 ### Step 3 — User Searches
 
@@ -504,31 +539,72 @@ flowchart TD
 
 ### Step 4 — User Clicks Play
 
-- `GET /stream/{titleId}/manifest` → Streaming Service
-- Check Redis for cached manifest → on miss, fetch from S3
-- Inject signed CDN URLs + DRM tokens into manifest
-- Return HLS `.m3u8` to client
-- Client fetches chunks directly from CDN: `GET /cdn/chunks/{id}/{res}/{chunk}`
-- CDN serves from edge cache → on miss, pulls from S3 origin
-- 1. What is a Manifest?
-- A manifest is a text file that acts as a table of contents for a video. Instead of serving one giant video file, Netflix breaks every video into small chunks (2-10 seconds each) and the manifest tells the player which chunks to fetch, in what order, and at what quality.
+**4a. What is a Manifest?**
 
-    HLS Manifest Example (.m3u8)
-    Code
-    #EXTM3U
-    #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
-    https://cdn.netflix.com/title123/360p/master.m3u8
-    #EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=842x480
-    https://cdn.netflix.com/title123/480p/master.m3u8
-    #EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
-    https://cdn.netflix.com/title123/720p/master.m3u8
-    #EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
-    https://cdn.netflix.com/title123/1080p/master.m3u8
+A manifest is a **text file that acts as a table of contents for a video**. Instead of serving one giant video file, Netflix breaks every video into small chunks (2-10 seconds each). The manifest tells the player **which chunks to fetch, in what order, and at what quality level**.
+
+HLS Master Manifest Example (`.m3u8`):
+```
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+https://cdn.netflix.com/title123/360p/master.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=842x480
+https://cdn.netflix.com/title123/480p/master.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+https://cdn.netflix.com/title123/720p/master.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+https://cdn.netflix.com/title123/1080p/master.m3u8
+```
+
+Each resolution-level manifest then lists individual chunks:
+```
+#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXTINF:4.0,
+https://cdn.netflix.com/title123/1080p/chunk_001.ts
+#EXTINF:4.0,
+https://cdn.netflix.com/title123/1080p/chunk_002.ts
+#EXTINF:4.0,
+https://cdn.netflix.com/title123/1080p/chunk_003.ts
+```
+
+**4b. What do we check in Redis when user clicks play?**
+
+The cached manifest with pre-signed CDN URLs:
+
+```
+Key:   manifest:{titleId}
+Value: {
+         masterUrl: "signed CDN URL for master.m3u8",
+         resolutions: {
+           "360p":  "signed CDN URL",
+           "480p":  "signed CDN URL",
+           "720p":  "signed CDN URL",
+           "1080p": "signed CDN URL",
+           "4K":    "signed CDN URL"
+         },
+         drmToken: "...",
+         expiresAt: "2026-02-26T12:05:00Z"
+       }
+TTL:   5 minutes (aligned with signed URL expiry)
+```
+
+**4c. Play Flow Step-by-Step:**
+
+- `GET /stream/{titleId}/manifest` → Streaming Service
+- Streaming Service checks Redis: `GET manifest:{titleId}`
+  - **HIT** → return cached manifest (~1ms)
+  - **MISS** → fetch manifest template from S3, generate signed CDN URLs + inject DRM tokens, cache in Redis with TTL 5 min
+- Return HLS `.m3u8` manifest to client
+- Client plays video → fetches chunks directly from CDN: `GET /cdn/chunks/{id}/{res}/{chunk}`
+  - **CDN HIT** → serve from edge cache (< 10ms)
+  - **CDN MISS** → CDN pulls from S3 origin, caches at edge, serves to client
+- Client uses ABR (Adaptive Bitrate): monitors bandwidth and switches between 480p/720p/1080p/4K chunk URLs dynamically
 
 ### Step 5 — Progress Tracking (Every 30s)
 
 - `POST /history` → Watch History Service
-- Write resume position to Redis (fast read for continue-watching)
+- Write resume position to Redis: `HSET resume:{userId} {titleId} {progressSec}` (fast read for continue-watching)
 - Persist full history to Cassandra (durable, CL=QUORUM)
 - Publish `view-event` to Kafka (async, fire-and-forget)
 
@@ -546,6 +622,28 @@ flowchart TD
 - Publish `content-ready` to Kafka
 - Workers update Elasticsearch index + notify Recommendation Service
 
+### Step 8 — Catalog Update (WRITE PATH — CQRS)
+
+**This is the write side of the CQRS pattern. Runs rarely (few times/day when content is added/updated).**
+
+- Admin updates title metadata via internal API
+- Catalog Service writes to **PostgreSQL** (source of truth, ACID, normalized)
+- Catalog Service publishes `catalog-updated` event to **Kafka**
+- Background Worker consumes the event and rebuilds Redis read store:
+  - Rebuild `catalog:genre:{genreId}` sorted set with updated scores
+  - Update `title:meta:{titleId}` hash with new metadata
+  - Update Elasticsearch index for search
+  - Invalidate affected `home_feed:*` cache keys
+- Users see updated catalog within **1-2 seconds** (eventual consistency — acceptable since catalog changes are rare)
+
+**CQRS Summary:**
+
+```
+WRITE PATH (rare):  Admin API → Catalog Service → PostgreSQL → Kafka → Worker → Redis + ES
+READ PATH (17K QPS): Client → Catalog Service → Redis (sorted sets + hashes) → Client
+                     PostgreSQL is NEVER hit on the read path
+```
+
 ## 9. Trade-offs
 
 | Decision | Chose | Over | Why |
@@ -554,7 +652,7 @@ flowchart TD
 | Search | Elasticsearch | DB LIKE query | Fuzzy, ranked, faceted search at 30K QPS |
 | Trending | Redis ZINCRBY | DB aggregation | O(log N) increment, instant top-K reads |
 | Video Delivery | CDN + S3 | Direct from origin | 50 Tbps at edge, sub-100ms latency globally |
-| Catalog Cache | Redis TTL 5m | No cache | 95% cache hit ratio, offloads PostgreSQL |
+| Catalog Read Path | Redis sorted sets (CQRS) | PostgreSQL direct reads | Read path never hits DB — 1ms vs 200ms, eliminates 425K SQL queries/sec |
 | Consistency | Eventual for analytics | Strong everywhere | Throughput over precision for trending/history |
 | Event Bus | Kafka | RabbitMQ | Replay capability, ordering, massive throughput |
 | Feed Strategy | Pull + cache (fan-out on read) | Pre-compute (fan-out on write) | 50K titles × 100M users impossible to pre-compute |
@@ -566,8 +664,8 @@ flowchart TD
 | What Fails | Impact | Mitigation |
 |------------|--------|------------|
 | Auth Service down | No new logins | Existing JWTs still valid (stateless), circuit breaker, multiple instances |
-| PostgreSQL primary down | No catalog writes | Auto-failover to streaming replica < 30s, reads continue from replicas |
-| Redis down | Cache miss spike | Circuit breaker → fallback to DB, auto-scale DB read replicas |
+| PostgreSQL primary down | No catalog writes | Auto-failover to streaming replica < 30s, reads continue from replicas. Read path unaffected (served from Redis) |
+| Redis down | Cache miss spike, read path degraded | Circuit breaker → fallback to DB, auto-scale DB read replicas |
 | Cassandra node down | Reduced write capacity | RF=3, CL=QUORUM → 2 of 3 replicas still serve reads/writes |
 | Kafka broker down | Event loss risk | Replication factor 3, min.insync.replicas=2, producer acks=all |
 | CDN edge down | Streaming disruption | Multi-CDN (CloudFront + Akamai), DNS failover |
