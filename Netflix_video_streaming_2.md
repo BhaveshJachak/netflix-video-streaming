@@ -535,9 +535,13 @@ flowchart TD
     
     CATALOG -->|READ| REDIS
     CATALOG -->|WRITE| PG_CATALOG[(PostgreSQL Catalog)]
+    PG_CATALOG --> KAFKA[Kafka]
+    KAFKA --> CACHE_WORKER[Cache Builder Worker]
+    CACHE_WORKER --> REDIS
+    CACHE_WORKER --> ES[(Elasticsearch)]
     CATALOG --> REC[Recommendation Service]
     
-    SEARCH --> ES[(Elasticsearch)]
+    SEARCH --> ES
     
     STREAM --> DRM[License Server]
     STREAM --> CDN
@@ -545,11 +549,10 @@ flowchart TD
     
     HISTORY --> CASS[(Cassandra)]
     HISTORY --> REDIS
-    HISTORY --> KAFKA[Kafka]
+    HISTORY --> KAFKA
     
     KAFKA --> SPARK[Spark MapReduce]
     SPARK --> REDIS
-    SPARK --> ES
     SPARK --> LAKE[(Data Lake)]
     
     LAKE --> ML[ML Training]
